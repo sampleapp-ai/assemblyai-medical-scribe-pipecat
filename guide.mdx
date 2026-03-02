@@ -1,207 +1,173 @@
----
-title: "Build a Medical Scribe with Pipecat and AssemblyAI"
-description: "Build a real-time ambient clinical documentation agent using Pipecat's pipeline framework, AssemblyAI's Universal-3 Pro streaming STT, and AssemblyAI's LLM Gateway for medical post-processing."
----
+# Build a Medical Scribe with Pipecat and AssemblyAI Universal-3 Pro
 
-## Overview
+Build a real-time ambient clinical documentation agent using Pipecat's pipeline framework, AssemblyAI Universal-3 Pro streaming STT with medical keyterms boosting, and AssemblyAI's LLM Gateway for per-turn medical editing and SOAP note generation. The scribe passively listens to a doctor-patient encounter, transcribes in real time, and generates structured clinical notes — without speaking or interrupting.
 
-In this guide, you'll build a listen-only medical scribe that captures a doctor-patient conversation in real time, post-processes each transcript turn for medical accuracy via AssemblyAI's LLM Gateway, and generates a structured SOAP note when the session ends. Unlike a voice agent, this is a **passive ambient scribe** — it listens and documents without speaking.
+<downloadandopenbuttons
+  downloadurl="/public/guardian/assemblyai/pipecat-medical-scribe.zip"
+  themecolor="#0000FF"
+/>
 
-### What you'll use
+### ❶ Install dependencies
 
-- **AssemblyAI Universal-3 Pro** — Streaming STT with conservative turn detection tuned for clinical pauses
-- **AssemblyAI LLM Gateway** — Per-turn medical editing and SOAP note generation
-- **Pipecat** — Pipeline framework for building the listen-only audio pipeline
-- **Next.js** — Custom frontend for live transcript and SOAP note display
+<codefocussection
+filepath="requirements.txt"
+filerange="1-5" title="Python dependencies"
+themeColor="#0000FF" label="Server">
 
-## Prerequisites
-
-To follow along, you'll need:
-
-- Python 3.10 or higher
-- Node.js 18 or higher
-- An [AssemblyAI API key](https://www.assemblyai.com/dashboard/signup) (used for both STT and LLM Gateway)
-
-## Project setup
-
-Create a new project directory and set up a virtual environment:
+Install Pipecat with plugins for AssemblyAI (speech-to-text), Silero (voice activity detection), and WebRTC (browser audio transport). Also install `httpx` for async HTTP calls to AssemblyAI's LLM Gateway, `FastAPI` and `uvicorn` for the server, and `python-dotenv` for environment variable loading.
 
 ```bash
-mkdir medical-scribe && cd medical-scribe
-python -m venv venv
-source venv/bin/activate
+pip install "pipecat-ai[assemblyai,silero,daily,webrtc]" python-dotenv fastapi uvicorn httpx
 ```
 
-Install the Python dependencies:
-
-```bash
-pip install "pipecat-ai[assemblyai,silero,daily,webrtc]" python-dotenv fastapi uvicorn requests
-```
-
-Download the Pipecat run helper, which provides the WebRTC transport and server setup:
-
-```bash
-curl -O https://raw.githubusercontent.com/pipecat-ai/pipecat/9f223442c2799d22aac8a552c0af1d0ae7ff42c2/src/pipecat/examples/run.py
-```
-
-Create a `.env` file with your API key:
-
-```env
-ASSEMBLYAI_API_KEY=your_assemblyai_api_key
-LLM_GATEWAY_MODEL=claude-haiku-4-5-20251001
-```
-
-Now create a `medical_scribe.py` file and follow along below.
-
-## Build the medical scribe
-
-<codefocussection
-  filepath="medical_scribe.py"
-  filerange="1-23"
-  title="Import dependencies and load environment"
-  themeColor="#0000FF"
-  label="Server"
->
-  Start by importing the Pipecat modules needed for the listen-only pipeline. Key imports include `AssemblyAISTTService` and `AssemblyAIConnectionParams` for streaming STT, `TranscriptionFrame` and `InterimTranscriptionFrame` for handling transcript data, `FrameProcessor` for building the custom transcript processor, and `SileroVADAnalyzer` for voice activity detection. Note that there are **no TTS or LLM imports** — this is a passive scribe that doesn't generate spoken responses.
 </codefocussection>
 
-<codefocussection
-  filepath="medical_scribe.py"
-  filerange="25-41"
-  title="Define shared state and medical keyterms"
-  themeColor="#0000FF"
-  label="Server"
->
-  The `transcript_queues` list holds asyncio queues for each connected WebSocket client, enabling real-time transcript broadcasting. The `encounter_buffer` accumulates all finalized, edited transcript turns for the session — this is what gets sent to the LLM Gateway for SOAP note generation at the end.
-
-  The `MEDICAL_KEYTERMS` list boosts recognition accuracy for domain-specific terminology: medication names with dosages, clinical section headers (chief complaint, HPI, review of systems), and examination terms. These are passed to AssemblyAI's `keyterms_prompt` parameter, which appends them to the model's default prompt.
-</codefocussection>
+### ❷ Configure API keys
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="43-74"
-  title="Build the LLM Gateway helper for per-turn medical editing"
-  themeColor="#0000FF"
-  label="Server"
->
-  The `post_process_with_llm` function sends each finalized transcript turn to AssemblyAI's LLM Gateway for medical accuracy correction. The system prompt instructs the model to keep the speaker's original words while fixing medical terminology — drug names, dosages, anatomy terms, and proper nouns. The temperature is set low (0.2) to minimize creative deviation from the original transcript.
+filepath=".env.example"
+filerange="1-2" title="Environment variables template"
+themeColor="#0000FF" label="Server">
 
-  The LLM Gateway uses the same AssemblyAI API key and supports OpenAI-compatible chat completions. This means you can swap models by changing the `LLM_GATEWAY_MODEL` environment variable.
+Create a `.env` file with your [AssemblyAI](https://www.assemblyai.com/) API key. This single key is used for both streaming speech-to-text (Universal-3 Pro) and the LLM Gateway (per-turn editing and SOAP note generation). Optionally set `LLM_GATEWAY_MODEL` to change the model used for post-processing.
+
 </codefocussection>
+
+### ❸ Import libraries and load environment
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="77-107"
-  title="Build the SOAP note generator"
-  themeColor="#0000FF"
-  label="Server"
->
-  The `generate_soap_note` function takes the full encounter buffer — all edited transcript turns with timestamps — and sends it to the LLM Gateway to produce a structured SOAP note (Subjective, Objective, Assessment, Plan). This is called when the client disconnects or when the user manually requests a SOAP note via the API.
+filepath="medical_scribe.py"
+filerange="1-23" title="Import libraries and load environment"
+themeColor="#0000FF" label="Server">
 
-  The system prompt instructs the model to use bullet points, stay factual, include medication dosages when mentioned, and never invent data that wasn't in the transcript.
+Import the Pipecat modules needed for a listen-only pipeline. Key imports include `AssemblyAISTTService` and `AssemblyAIConnectionParams` for streaming STT, `TranscriptionFrame` and `InterimTranscriptionFrame` for handling transcript data, `FrameProcessor` for building the custom transcript processor, and `SileroVADAnalyzer` for voice activity detection. Note there are **no TTS or LLM imports** — this is a passive scribe that doesn't generate spoken responses. `httpx` is used for async HTTP calls to the LLM Gateway.
+
 </codefocussection>
+
+### ❹ Define shared state and medical keyterms
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="110-142"
-  title="Create the custom transcript processor"
-  themeColor="#0000FF"
-  label="Server"
->
-  `MedicalTranscriptProcessor` is the core of the medical scribe — a custom Pipecat `FrameProcessor` that sits in the pipeline after the STT service. It handles two types of frames:
+filepath="medical_scribe.py"
+filerange="25-38" title="Define shared state and medical keyterms"
+themeColor="#0000FF" label="Server">
 
-  - **`InterimTranscriptionFrame`** — Partial transcripts (the user is still speaking). These are broadcast to connected clients for a live "typing" effect but are not post-processed or stored.
-  - **`TranscriptionFrame`** — Finalized transcript turns. Each finalized turn is sent to the LLM Gateway for medical editing (run in a thread to avoid blocking the pipeline), stored in the encounter buffer, and broadcast to all connected WebSocket clients.
+The `transcript_queues` list holds asyncio queues for each connected WebSocket client, enabling real-time transcript broadcasting. The `encounter_buffer` accumulates all finalized, edited transcript turns for the session — this is what gets sent to the LLM Gateway for SOAP note generation at the end.
 
-  The `broadcast_transcript` helper pushes entries to all client queues using `put_nowait` to avoid blocking if a client is slow to consume.
+The `MEDICAL_KEYTERMS` list boosts recognition accuracy for domain-specific terminology: medication names with dosages, clinical section headers (chief complaint, HPI, review of systems), and examination terms. These are passed to AssemblyAI's `keyterms_prompt` parameter, which appends them to the model's default prompt without replacing the optimized turn-detection behavior.
+
 </codefocussection>
+
+### ❺ Define LLM Gateway prompts
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="145-160"
-  title="Configure transport options (listen-only)"
-  themeColor="#0000FF"
-  label="Server"
->
-  Unlike a voice agent, the medical scribe sets `audio_out_enabled=False` on all transports — no audio is sent back to the client. The scribe only receives audio input from the microphone. Silero VAD is still used for voice activity detection, which helps the STT service determine when speech starts and stops.
+filepath="medical_scribe.py"
+filerange="40-57" title="Define LLM Gateway prompts"
+themeColor="#0000FF" label="Server">
+
+Two system prompts drive the LLM Gateway calls. The `MEDICAL_EDITING_SYSTEM_PROMPT` instructs the model to return only the corrected transcript text — fixing drug names, dosages, anatomy terms, and punctuation while preserving the speaker's original meaning. The `SOAP_NOTE_SYSTEM_PROMPT` instructs the model to produce a structured SOAP note (Subjective, Objective, Assessment, Plan) using bullet points and factual content only.
+
 </codefocussection>
+
+### ❻ Build the LLM Gateway helper
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="163-182"
-  title="Configure AssemblyAI STT with conservative turn detection"
-  themeColor="#0000FF"
-  label="Server"
->
-  This is where the medical scribe's STT configuration differs significantly from a voice agent. The turn detection is set to **conservative** values:
+filepath="medical_scribe.py"
+filerange="60-88" title="Build the LLM Gateway helper for medical editing"
+themeColor="#0000FF" label="Server">
 
-  - **`min_end_of_turn_silence_when_confident=800`** — Wait 800ms of silence before checking for terminal punctuation. Clinical conversations have natural pauses where a doctor might pause to examine a patient or a patient pauses to recall symptoms.
-  - **`max_turn_silence=3600`** — Allow up to 3.6 seconds of silence before forcing a turn end. This prevents premature turn endings during physical examinations or when the doctor is writing notes.
+The `call_llm_gateway` function sends requests to AssemblyAI's LLM Gateway at `https://llm-gateway.assemblyai.com/v1/chat/completions`. It uses the same AssemblyAI API key and supports OpenAI-compatible chat completions — you can swap models by changing the `LLM_GATEWAY_MODEL` environment variable. The temperature is set low (0.2) to minimize creative deviation from the original transcript.
 
-  Compare this to a voice agent which uses 100ms/1200ms for snappy turn-taking. The `vad_force_turn_endpoint=False` flag remains critical — it tells Pipecat to rely on AssemblyAI's punctuation-based turn detection rather than VAD-based silence detection.
+The `post_process_turn` wrapper sends each finalized transcript turn through the medical editing prompt, falling back to the original text if the LLM call fails.
+
 </codefocussection>
+
+### ❼ Build the SOAP note generator
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="184-198"
-  title="Assemble the listen-only pipeline"
-  themeColor="#0000FF"
-  label="Server"
->
-  The pipeline is dramatically simpler than a voice agent's. It has just three stages:
+filepath="medical_scribe.py"
+filerange="91-103" title="Build the SOAP note generator"
+themeColor="#0000FF" label="Server">
 
-  1. **`transport.input()`** — Receives audio from the client's microphone via WebRTC
-  2. **`stt`** — AssemblyAI Universal-3 Pro transcribes the audio in real time
-  3. **`processor`** — The custom `MedicalTranscriptProcessor` handles post-processing and broadcasting
+The `generate_soap_note` function takes the full encounter buffer — all edited transcript turns with timestamps — and sends it to the LLM Gateway to produce a structured SOAP note. This is called on demand when the user clicks "Generate SOAP Note" in the client after ending the encounter.
 
-  There's no LLM, TTS, or `transport.output()` — the scribe is purely passive. The `allow_interruptions=False` setting reflects this: there's nothing to interrupt since the agent doesn't speak.
 </codefocussection>
+
+### ❽ Create the custom transcript processor
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="200-220"
-  title="Handle connection events and SOAP note generation"
-  themeColor="#0000FF"
-  label="Server"
->
-  When a client connects, the scribe simply logs and starts listening. When the client disconnects, the scribe generates a SOAP note from the full encounter transcript via the LLM Gateway. The SOAP note is:
+filepath="medical_scribe.py"
+filerange="106-141" title="Create the custom transcript processor"
+themeColor="#0000FF" label="Server">
 
-  1. **Broadcast** to any still-connected WebSocket clients (the client may receive it if the WebSocket closes after the WebRTC connection)
-  2. **Saved to a file** with a timestamped filename for permanent storage
+`MedicalTranscriptProcessor` is the core of the medical scribe — a custom Pipecat `FrameProcessor` that sits in the pipeline after the STT service. It handles two types of frames:
 
-  The SOAP generation runs in a thread (`asyncio.to_thread`) since it makes a synchronous HTTP request to the LLM Gateway.
+- **`InterimTranscriptionFrame`** — Partial transcripts (the user is still speaking). These are broadcast to connected clients for a live "typing" effect but are not post-processed or stored.
+- **`TranscriptionFrame`** — Finalized transcript turns. Each turn is sent to the LLM Gateway for medical editing, stored in the encounter buffer with both the original and edited text, and broadcast to all connected WebSocket clients.
+
+The `broadcast_transcript` helper pushes entries to all client queues using `put_nowait` to avoid blocking if a client is slow to consume.
+
 </codefocussection>
+
+### ❾ Configure transport options (listen-only)
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="222-263"
-  title="Register API routes for transcript streaming"
-  themeColor="#0000FF"
-  label="Server"
->
-  The `setup_routes` function adds three API endpoints to the FastAPI server alongside the WebRTC signaling routes:
+filepath="medical_scribe.py"
+filerange="144-157" title="Configure transport options (listen-only)"
+themeColor="#0000FF" label="Server">
 
-  - **`/ws/transcripts`** (WebSocket) — Real-time transcript streaming. When a client connects, it receives all existing transcript entries, then streams new entries as they arrive. Each client gets its own asyncio queue for independent consumption.
-  - **`/api/soap-note`** (POST) — On-demand SOAP note generation from the current encounter buffer.
-  - **`/api/transcripts`** (GET) — Fetch all transcript entries accumulated so far.
-  - **`/api/reset`** (POST) — Clear the encounter buffer for a new session.
+Unlike a voice agent, the medical scribe sets `audio_out_enabled=False` on all transports — no audio is sent back to the client. The scribe only receives audio input from the microphone. Silero VAD is still used for voice activity detection, which helps the STT service determine when speech starts and stops.
 
-  CORS is enabled for all origins since the Next.js client runs on a different port during development.
 </codefocussection>
+
+### ❿ Configure AssemblyAI STT with conservative turn detection
 
 <codefocussection
-  filepath="medical_scribe.py"
-  filerange="265-268"
-  title="Run the medical scribe"
-  themeColor="#0000FF"
-  label="Server"
->
-  The entry point uses Pipecat's run helper with the `setup_routes` callback. The run helper starts a FastAPI server with WebRTC signaling on port 7860, and our `setup_routes` function adds the transcript WebSocket and SOAP note API endpoints to the same server.
+filepath="medical_scribe.py"
+filerange="160-199" title="Configure STT and assemble the pipeline"
+themeColor="#0000FF" label="Server">
+
+This is where the medical scribe's STT configuration differs significantly from a voice agent. The turn detection is set to **conservative** values:
+
+- **`min_end_of_turn_silence_when_confident=800`** — Wait 800ms of silence before checking for terminal punctuation. Clinical conversations have natural pauses where a doctor might pause to examine a patient or a patient pauses to recall symptoms.
+- **`max_turn_silence=3600`** — Allow up to 3.6 seconds of silence before forcing a turn end. This prevents premature turn endings during physical examinations or when the doctor is writing notes.
+
+Compare this to a voice agent which uses 100ms/1200ms for snappy turn-taking. The `vad_force_turn_endpoint=False` flag tells Pipecat to rely on AssemblyAI's punctuation-based turn detection rather than VAD-based silence detection.
+
+The pipeline itself is dramatically simpler than a voice agent's — just three stages: `transport.input()` receives audio, `stt` transcribes it, and `processor` handles post-processing and broadcasting. There's no LLM, TTS, or `transport.output()`.
+
 </codefocussection>
 
-## Set up the client
+### ⓫ Register API routes for transcript streaming and SOAP generation
 
-The medical scribe uses a custom Next.js frontend (in `client/`) that connects to the Pipecat server via WebRTC for audio capture and WebSocket for real-time transcript streaming. Set up the client:
+<codefocussection
+filepath="medical_scribe.py"
+filerange="202-259" title="Register API routes"
+themeColor="#0000FF" label="Server">
+
+The `setup_routes` function adds endpoints to the FastAPI server alongside the WebRTC signaling routes:
+
+- **`/ws/transcripts`** (WebSocket) — Bidirectional transcript streaming. The `send_loop` pushes existing and new transcript entries to the client. The `recv_loop` listens for commands — when the client sends `{"type": "generate_soap"}`, the server generates a SOAP note via the LLM Gateway and sends it back over the same WebSocket.
+- **`/api/soap`** (POST) — HTTP fallback for SOAP note generation, used when the WebSocket is no longer open (e.g., after ending the encounter).
+- **`/api/reset`** (POST) — Clear the encounter buffer for a new session.
+
+CORS is enabled for all origins since the Next.js client runs on a different port during development.
+
+</codefocussection>
+
+### ⓬ Run the medical scribe
+
+<codefocussection
+filepath="medical_scribe.py"
+filerange="262-265" title="Run the medical scribe"
+themeColor="#0000FF" label="Server">
+
+The entry point uses Pipecat's run helper with the `setup_routes` callback. The run helper starts a FastAPI server with WebRTC signaling on port 7860, and the `setup_routes` function adds the transcript WebSocket and SOAP note API endpoints to the same server.
+
+</codefocussection>
+
+### ⓭ Set up and run the client
+
+Set up the Next.js client:
 
 ```bash
 cd client
@@ -209,11 +175,7 @@ npm install
 cp .env.example .env.local
 ```
 
-The client connects to `http://localhost:7860` by default. To change this, set `NEXT_PUBLIC_BACKEND_URL` in `.env.local`.
-
-## Run the medical scribe
-
-Start the server:
+Start the server (from the project root):
 
 ```bash
 python medical_scribe.py
@@ -226,31 +188,4 @@ cd client
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser. Click **Start Recording** and begin speaking. The transcript appears in real time on the left panel. When you click **End Session** or **Generate**, a SOAP note appears on the right.
-
-## How the pipeline differs from a voice agent
-
-| Aspect | Voice Agent | Medical Scribe |
-|---|---|---|
-| Pipeline | STT → LLM → TTS → Speaker | STT → Custom Processor (listen-only) |
-| Audio output | Yes (TTS) | No |
-| Turn detection | Aggressive (100ms / 1200ms) | Conservative (800ms / 3600ms) |
-| Post-processing | None (LLM generates response) | LLM Gateway edits each turn for medical accuracy |
-| End-of-session | Nothing | SOAP note generation |
-| Interruptions | Enabled (barge-in) | Disabled (passive) |
-
-## Hybrid approach: streaming + async
-
-Speaker diarization and PII redaction are async-only features. For production, use a hybrid workflow:
-
-1. **During the visit** — Stream audio for real-time transcription and documentation (this app)
-2. **Post-visit** — Process the recording through AssemblyAI's async API for speaker-labeled, PII-redacted SOAP notes
-
-This gives clinicians immediate access to documentation while ensuring the final record is compliant.
-
-## Next steps
-
-- **Update keyterms per stage**: Use `UpdateConfiguration` to swap keyterms as the encounter progresses (e.g., intake terms → examination terms → medication terms)
-- **Add speaker labels**: Integrate async API post-processing for speaker diarization
-- **PII redaction**: Process the full recording through the async API to redact patient identifiers before storage
-- **Multi-encounter support**: Add session management to handle multiple encounters without restarting the server
+Open [http://localhost:3000](http://localhost:3000) in your browser. Click **Start Encounter** and begin speaking. The transcript appears in real time on the left panel. Click **End Encounter** to stop recording, then click **Generate SOAP Note** to produce a structured clinical note on the right panel.
