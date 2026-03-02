@@ -1,0 +1,5 @@
+pipecat-ai[assemblyai,silero,daily,webrtc]
+python-dotenv
+fastapi
+uvicorn
+httpx
