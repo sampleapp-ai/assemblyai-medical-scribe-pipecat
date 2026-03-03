@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import InterimTranscriptionFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -18,13 +19,12 @@ from pipecat.services.assemblyai.stt import (
     AssemblyAISTTService,
 )
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.services.daily import DailyParams
+from pipecat.transports.daily.transport import DailyParams
 
 load_dotenv(override=True)
 
-# --- Shared state for transcript broadcasting ---
+# --- Shared state ---
 
-transcript_queues: list[asyncio.Queue] = []
 encounter_buffer: list[dict] = []
 
 MEDICAL_KEYTERMS = [
@@ -40,12 +40,14 @@ MEDICAL_KEYTERMS = [
 LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1/chat/completions"
 
 MEDICAL_EDITING_SYSTEM_PROMPT = (
-    "You are a clinical transcription editor. Your task: return ONLY the "
-    "corrected text, with no preamble, explanation, or commentary. "
+    "You are a clinical transcription editor. "
+    "Return ONLY the corrected text with no preamble, explanation, or commentary. "
+    "Do NOT say things like 'I'm ready to help' or ask questions. "
+    "Simply output the corrected version of the input text. "
     "Fix medical terminology (drug names, dosages, anatomy), proper nouns, "
     "and punctuation for readability. Preserve the speaker's original meaning "
-    "and avoid inventing details. Prefer U.S. clinical style. If a medication "
-    "or condition is phonetically close, correct to the most likely clinical term."
+    "and avoid inventing details. If the input is very short or unclear, "
+    "return it as-is with minimal corrections."
 )
 
 SOAP_NOTE_SYSTEM_PROMPT = (
@@ -103,15 +105,6 @@ async def generate_soap_note() -> str:
     return result or "Unable to generate SOAP note. Please try again."
 
 
-async def broadcast_transcript(entry: dict):
-    """Send a transcript entry to all connected WebSocket clients."""
-    for queue in list(transcript_queues):
-        try:
-            queue.put_nowait(entry)
-        except asyncio.QueueFull:
-            pass
-
-
 class MedicalTranscriptProcessor(FrameProcessor):
     """Collect finalized transcripts, post-process via LLM Gateway, and broadcast to clients."""
 
@@ -119,7 +112,9 @@ class MedicalTranscriptProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InterimTranscriptionFrame) and frame.text:
-            await broadcast_transcript({
+            logger.debug(f"[INTERIM] {frame.text}")
+            from run import broadcast
+            await broadcast({
                 "type": "interim",
                 "text": frame.text,
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
@@ -127,16 +122,19 @@ class MedicalTranscriptProcessor(FrameProcessor):
 
         elif isinstance(frame, TranscriptionFrame) and frame.text:
             original = frame.text
-            edited = await post_process_turn(original)
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            
+            # Send original immediately for low latency display
             entry = {
                 "type": "transcript",
-                "text": edited,
+                "text": original,
                 "original": original,
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "timestamp": timestamp,
             }
             encounter_buffer.append(entry)
-            await broadcast_transcript(entry)
-            logger.info(f"[SCRIBE] {edited[:80]}...")
+            from run import broadcast
+            await broadcast(entry)
+            logger.info(f"[SCRIBE] {original[:80]}...")
 
         await self.push_frame(frame, direction)
 
@@ -147,12 +145,26 @@ transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(),
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(
+                confidence=0.6,
+                start_secs=0.1,
+                stop_secs=0.8,  # Wait 800ms of silence before ending turn
+                min_volume=0.4,
+            )
+        ),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(),
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(
+                confidence=0.6,
+                start_secs=0.1,
+                stop_secs=0.8,
+                min_volume=0.4,
+            )
+        ),
     ),
 }
 
@@ -162,10 +174,9 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
 
     stt = AssemblyAISTTService(
         api_key=os.getenv("ASSEMBLYAI_API_KEY"),
-        vad_force_turn_endpoint=False,
+        vad_force_turn_endpoint=True,  # Use VAD for turn detection with universal-streaming
         connection_params=AssemblyAIConnectionParams(
-            min_end_of_turn_silence_when_confident=800,
-            max_turn_silence=3600,
+            speech_model="universal-streaming-english",
             keyterms_prompt=MEDICAL_KEYTERMS,
         ),
     )
@@ -200,8 +211,7 @@ async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_si
 
 
 def setup_routes(app):
-    """Register additional FastAPI routes for transcript streaming and SOAP generation."""
-    from fastapi import WebSocket as FastAPIWebSocket
+    """Register additional FastAPI routes for SOAP generation."""
     from fastapi.middleware.cors import CORSMiddleware
 
     app.add_middleware(
@@ -211,42 +221,6 @@ def setup_routes(app):
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.websocket("/ws/transcripts")
-    async def transcript_websocket(websocket: FastAPIWebSocket):
-        await websocket.accept()
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        transcript_queues.append(queue)
-
-        async def send_loop():
-            """Push transcript entries from the queue to the client."""
-            try:
-                for entry in encounter_buffer:
-                    await websocket.send_json(entry)
-                while True:
-                    entry = await queue.get()
-                    await websocket.send_json(entry)
-            except Exception:
-                pass
-
-        async def recv_loop():
-            """Listen for client commands (e.g. generate_soap)."""
-            try:
-                while True:
-                    data = await websocket.receive_json()
-                    if data.get("type") == "generate_soap":
-                        await websocket.send_json({"type": "status", "message": "Generating SOAP note..."})
-                        soap = await generate_soap_note()
-                        await websocket.send_json({"type": "soap_note", "content": soap})
-                        logger.info("SOAP note generated and sent to client")
-            except Exception:
-                pass
-
-        try:
-            await asyncio.gather(send_loop(), recv_loop())
-        finally:
-            if queue in transcript_queues:
-                transcript_queues.remove(queue)
 
     @app.post("/api/soap")
     async def api_soap():

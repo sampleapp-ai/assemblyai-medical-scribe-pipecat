@@ -1,9 +1,3 @@
-#
-# Copyright (c) 2024–2025, Daily
-#
-# SPDX-License-Identifier: BSD 2-Clause License
-#
-
 import argparse
 import asyncio
 import json
@@ -14,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, Mapping, Optional
 
 import aiohttp
+import time as _time
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Request, WebSocket
@@ -23,16 +18,25 @@ from loguru import logger
 
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.network.fastapi_websocket import (
-    FastAPIWebsocketParams,
-    FastAPIWebsocketTransport,
-)
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import IceServer, SmallWebRTCConnection
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
-# Load environment variables
 load_dotenv(override=True)
+
+_websocket_clients: set = set()
+
+
+async def broadcast(data: dict):
+    """Broadcast a JSON message to all connected WebSocket clients."""
+    disconnected = set()
+    message = json.dumps(data)
+    for ws in _websocket_clients:
+        try:
+            await ws.send_text(message)
+        except Exception:
+            disconnected.add(ws)
+    _websocket_clients.difference_update(disconnected)
 
 
 def get_transport_client_id(transport: BaseTransport, client: Any) -> str:
@@ -66,20 +70,102 @@ def run_example_daily(
     run_example: Callable,
     args: argparse.Namespace,
     params: DailyParams,
+    setup_routes: Optional[Callable] = None,
 ):
-    logger.info("Running example with DailyTransport...")
+    logger.info("Running example with DailyTransport (web server mode)...")
 
-    from pipecat.examples.daily_runner import configure
+    app = FastAPI()
 
-    async def run():
+    daily_api_key = os.getenv("DAILY_API_KEY")
+    if not daily_api_key:
+        logger.error("DAILY_API_KEY environment variable is required for daily transport")
+        return
+
+    if setup_routes:
+        setup_routes(app)
+
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return {"status": "ok", "app": "medical-scribe-pipecat"}
+
+    @app.websocket("/ws/transcripts")
+    async def transcript_ws(websocket: WebSocket):
+        await websocket.accept()
+        _websocket_clients.add(websocket)
+        logger.info("Transcript WebSocket client connected")
+        try:
+            while True:
+                await websocket.receive_text()
+        except Exception:
+            pass
+        finally:
+            _websocket_clients.discard(websocket)
+            logger.info("Transcript WebSocket client disconnected")
+
+    @app.post("/api/create-room")
+    async def create_room(background_tasks: BackgroundTasks):
         async with aiohttp.ClientSession() as session:
-            (room_url, token) = await configure(session)
+            async with session.post(
+                "https://api.daily.co/v1/rooms",
+                headers={"Authorization": f"Bearer {daily_api_key}"},
+                json={
+                    "properties": {
+                        "exp": int(_time.time()) + 3600,
+                        "enable_chat": False,
+                        "start_video_off": True,
+                    }
+                },
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.error(f"Failed to create Daily room: {error}")
+                    return {"error": "Failed to create room"}
+                room_data = await resp.json()
 
-            # Run example function with DailyTransport transport arguments.
-            transport = DailyTransport(room_url, token, "Pipecat", params=params)
-            await run_example(transport, args, True)
+            room_url = room_data["url"]
+            room_name = room_data["name"]
+            logger.info(f"Created Daily room: {room_url}")
 
-    asyncio.run(run())
+            async with session.post(
+                "https://api.daily.co/v1/meeting-tokens",
+                headers={"Authorization": f"Bearer {daily_api_key}"},
+                json={
+                    "properties": {
+                        "room_name": room_name,
+                        "is_owner": False,
+                    }
+                },
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.error(f"Failed to create Daily token: {error}")
+                    return {"error": "Failed to create token"}
+                token_data = await resp.json()
+
+            user_token = token_data["token"]
+
+            async with session.post(
+                "https://api.daily.co/v1/meeting-tokens",
+                headers={"Authorization": f"Bearer {daily_api_key}"},
+                json={
+                    "properties": {
+                        "room_name": room_name,
+                        "is_owner": True,
+                    }
+                },
+            ) as resp:
+                bot_token_data = await resp.json()
+                bot_token = bot_token_data["token"]
+
+        async def start_bot():
+            transport = DailyTransport(room_url, bot_token, "Medical Scribe Bot", params=params)
+            await run_example(transport, args, False)
+
+        background_tasks.add_task(start_bot)
+
+        return {"room_url": room_url, "token": user_token}
+
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 def run_example_webrtc(
@@ -92,11 +178,9 @@ def run_example_webrtc(
 
     app = FastAPI()
 
-    # Register additional routes (e.g. transcript streaming, SOAP API)
     if setup_routes:
         setup_routes(app)
 
-    # Store connections by pc_id
     pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
     ice_servers = [
@@ -105,7 +189,47 @@ def run_example_webrtc(
         )
     ]
 
-    # Session-based endpoints for prebuilt UI v2.x
+    turn_url = os.getenv("TURN_URL")
+    turn_username = os.getenv("TURN_USERNAME")
+    turn_credential = os.getenv("TURN_CREDENTIAL")
+    if turn_url:
+        ice_servers.append(
+            IceServer(
+                urls=turn_url,
+                username=turn_username or "",
+                credential=turn_credential or "",
+            )
+        )
+
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return {"status": "ok", "app": "medical-scribe-pipecat"}
+
+    @app.get("/api/ice-servers")
+    async def get_ice_servers():
+        servers = [{"urls": "stun:stun.l.google.com:19302"}]
+        if turn_url:
+            servers.append({
+                "urls": turn_url,
+                "username": turn_username or "",
+                "credential": turn_credential or "",
+            })
+        return servers
+
+    @app.websocket("/ws/transcripts")
+    async def transcript_ws(websocket: WebSocket):
+        await websocket.accept()
+        _websocket_clients.add(websocket)
+        logger.info("Transcript WebSocket client connected")
+        try:
+            while True:
+                await websocket.receive_text()
+        except Exception:
+            pass
+        finally:
+            _websocket_clients.discard(websocket)
+            logger.info("Transcript WebSocket client disconnected")
+
     sessions_map: Dict[str, SmallWebRTCConnection] = {}
 
     @app.post("/start")
@@ -176,81 +300,20 @@ def run_example_webrtc(
                 logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
                 pcs_map.pop(webrtc_connection.pc_id, None)
 
-            # Run example function with SmallWebRTC transport arguments.
             transport = SmallWebRTCTransport(params=params, webrtc_connection=pipecat_connection)
             background_tasks.add_task(run_example, transport, args, False)
 
         answer = pipecat_connection.get_answer()
-        # Updating the peer connection inside the map
         pcs_map[answer["pc_id"]] = pipecat_connection
 
         return answer
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield  # Run app
+        yield
         coros = [pc.close() for pc in pcs_map.values()]
         await asyncio.gather(*coros)
         pcs_map.clear()
-
-    uvicorn.run(app, host=args.host, port=args.port)
-
-
-def run_example_twilio(
-    run_example: Callable,
-    args: argparse.Namespace,
-    params: FastAPIWebsocketParams,
-):
-    logger.info("Running example with FastAPIWebsocketTransport (Twilio)...")
-
-    app = FastAPI()
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Allow all origins for testing
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    @app.post("/")
-    async def start_call():
-        logger.debug("POST TwiML")
-
-        xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://{args.proxy}/ws"></Stream>
-  </Connect>
-  <Pause length="40"/>
-</Response>
-        """
-        return HTMLResponse(content=xml_content, media_type="application/xml")
-
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket):
-        await websocket.accept()
-
-        logger.debug("WebSocket connection accepted")
-
-        # Reading Twilio data.
-        start_data = websocket.iter_text()
-        await start_data.__anext__()
-        call_data = json.loads(await start_data.__anext__())
-        print(call_data, flush=True)
-        stream_sid = call_data["start"]["streamSid"]
-        call_sid = call_data["start"]["callSid"]
-
-        # Create websocket transport and update params.
-        params.add_wav_header = False
-        params.serializer = TwilioFrameSerializer(
-            stream_sid=stream_sid,
-            call_sid=call_sid,
-            account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
-            auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
-        )
-        transport = FastAPIWebsocketTransport(websocket=websocket, params=params)
-        await run_example(transport, args, False)
 
     uvicorn.run(app, host=args.host, port=args.port)
 
@@ -268,11 +331,9 @@ def run_main(
     params = transport_params[args.transport]()
     match args.transport:
         case "daily":
-            run_example_daily(run_example, args, params)
+            run_example_daily(run_example, args, params, setup_routes=setup_routes)
         case "webrtc":
             run_example_webrtc(run_example, args, params, setup_routes=setup_routes)
-        case "twilio":
-            run_example_twilio(run_example, args, params)
 
 
 def main(
@@ -294,19 +355,14 @@ def main(
         "--transport",
         "-t",
         type=str,
-        choices=["daily", "webrtc", "twilio"],
-        default="webrtc",
+        choices=["daily", "webrtc"],
+        default="daily",
         help="The transport this example should use",
-    )
-    parser.add_argument(
-        "--proxy", "-x", help="A public proxy host name (no protocol, e.g. proxy.example.com)"
     )
     parser.add_argument("--verbose", "-v", action="count", default=0)
     args = parser.parse_args()
 
-    # Log level
     logger.remove(0)
     logger.add(sys.stderr, level="TRACE" if args.verbose else "DEBUG")
 
-    # Import the bot file
     run_main(run_example, args, transport_params, setup_routes=setup_routes)

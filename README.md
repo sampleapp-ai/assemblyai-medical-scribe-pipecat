@@ -1,122 +1,160 @@
-# Medical Scribe — Pipecat + AssemblyAI Universal-3 Pro
+# Medical Scribe — Real-Time Ambient Clinical Documentation
 
-A real-time ambient clinical documentation agent using Pipecat's pipeline framework and AssemblyAI's Universal-3 Pro streaming speech-to-text. The agent listens to a doctor-patient conversation, transcribes in real time, post-processes each turn through AssemblyAI's LLM Gateway for medical terminology correction, and generates a SOAP note at session end. This is a **passive, listen-only scribe** — no TTS output.
+A real-time ambient clinical documentation agent built with [Pipecat](https://github.com/pipecat-ai/pipecat) and [AssemblyAI](https://www.assemblyai.com/). The agent passively listens to doctor-patient conversations, transcribes speech in real time with medical terminology boosting, and automatically generates structured SOAP notes at session end.
 
-## Architecture
+**This is a passive, listen-only scribe** — it captures and documents without interrupting the clinical workflow.
+
+## How It Works
 
 ```
-Microphone → AssemblyAI STT (U3P) → LLM Gateway (per-turn editing) → Client UI
-                                                                     ↓
-                                                              SOAP note (on disconnect)
+┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐     ┌────────────┐
+│  Microphone │────▶│  AssemblyAI STT      │────▶│  LLM Gateway    │────▶│  Client UI │
+│             │     │  (Universal Streaming)│     │  (Terminology   │     │            │
+└─────────────┘     └──────────────────────┘     │   Correction)   │     └────────────┘
+                                                 └─────────────────┘            │
+                                                                                ▼
+                                                                         ┌────────────┐
+                                                                         │ SOAP Note  │
+                                                                         │ Generation │
+                                                                         └────────────┘
 ```
 
-- **STT**: AssemblyAI Universal-3 Pro (`u3-rt-pro`) — sub-300ms streaming transcription with conservative turn detection tuned for clinical pauses
-- **LLM Gateway**: AssemblyAI LLM Gateway (`claude-3-5-haiku`) — per-turn medical terminology correction + SOAP note generation
-- **Transport**: WebRTC via Pipecat (audio input only, no output)
-- **Client**: Custom Next.js frontend showing live transcript and SOAP notes
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| **Speech-to-Text** | AssemblyAI Universal Streaming | Sub-300ms streaming transcription with medical keyterms boosting |
+| **Post-Processing** | AssemblyAI LLM Gateway | Per-turn medical terminology correction (drug names, dosages, anatomy) |
+| **Transport** | Pipecat (Daily/WebRTC) | Real-time audio streaming (input only) |
+| **Frontend** | Next.js | Live transcript display with interim results and SOAP note panel |
+
+## Features
+
+- **Ambient listening** — Passively transcribes without TTS or voice responses, preserving natural clinical conversation flow
+- **Medical keyterms boosting** — Domain-specific vocabulary (medications, conditions, procedures) boosted for higher accuracy
+- **Conservative turn detection** — 800ms silence threshold tuned for natural clinical pauses where speakers take longer breaks
+- **Real-time LLM correction** — Each finalized turn is post-processed to fix medical terminology, drug names, and dosages
+- **Automatic SOAP notes** — Generates structured Subjective/Objective/Assessment/Plan documentation on session end
+- **Live interim transcripts** — Shows partial results as speech is being recognized for immediate feedback
 
 ## Prerequisites
 
 - Python 3.10+
 - Node.js 18+
-- An AssemblyAI API key (used for both STT and LLM Gateway)
+- [AssemblyAI API key](https://www.assemblyai.com/dashboard/signup) (powers both STT and LLM Gateway)
 
-## Setup
+## Quick Start
 
-### Server
-
-1. Navigate to this directory:
+### 1. Server Setup
 
 ```bash
 cd medical-scribe/pipecat
-```
 
-2. Create a virtual environment and install dependencies:
-
-```bash
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
-```
 
-3. Copy `.env.example` to `.env` and add your API key:
-
-```bash
+# Configure environment
 cp .env.example .env
+# Edit .env and add your ASSEMBLYAI_API_KEY
 ```
 
-### Client
-
-1. Navigate to the client directory and install dependencies:
+### 2. Client Setup
 
 ```bash
 cd client
 npm install
-```
-
-2. Copy `.env.example` to `.env.local`:
-
-```bash
 cp .env.example .env.local
 ```
 
-## Running
+### 3. Run the Application
 
-Start the server (from the `medical-scribe/pipecat` directory):
+Start the server:
 
 ```bash
 python medical_scribe.py
 ```
 
-In a separate terminal, start the client (from `medical-scribe/pipecat/client`):
+In a separate terminal, start the client:
 
 ```bash
+cd client
 npm run dev
 ```
 
-Open `http://localhost:3000` in your browser. Click **Start Recording** and begin the clinical encounter. The transcript updates in real time. When you click **End Session**, a SOAP note is auto-generated.
-
-## Key Features
-
-- **Listen-only pipeline**: No TTS or LLM response — the agent passively transcribes without interrupting the clinical workflow
-- **Conservative turn detection**: `min_end_of_turn_silence_when_confident` set to 800ms and `max_turn_silence` set to 3600ms, tuned for natural clinical pauses where doctors and patients take longer breaks between phrases
-- **Medical keyterms boosting**: Domain-specific terms (medications, conditions, exam procedures) are boosted for higher transcription accuracy
-- **Per-turn LLM editing**: Each finalized transcript turn is post-processed through AssemblyAI's LLM Gateway to correct medical terminology, drug names, dosages, and anatomy terms
-- **SOAP note generation**: Full encounter transcript is sent to the LLM Gateway on session end to produce a structured Subjective/Objective/Assessment/Plan note
-- **Real-time client**: Custom Next.js frontend with live transcript display, interim (partial) transcripts, and SOAP note panel
+Open http://localhost:3000 in your browser. Click **Start Recording** to begin capturing the clinical encounter. The transcript updates in real time. Click **End Session** to generate the SOAP note.
 
 ## Configuration
 
-### Turn Detection
-
-Adjust turn detection timing in the `AssemblyAIConnectionParams`:
-
-| Parameter | Value | Description |
-|---|---|---|
-| `min_end_of_turn_silence_when_confident` | 800ms | Conservative — allows clinical pauses without prematurely ending turns |
-| `max_turn_silence` | 3600ms | Long timeout for extended clinical silences (e.g., during physical examination) |
-
 ### Medical Keyterms
 
-Update the `MEDICAL_KEYTERMS` list to boost recognition of terminology specific to your clinical specialty:
+Customize the `MEDICAL_KEYTERMS` list in `medical_scribe.py` to boost recognition for your clinical specialty:
 
 ```python
 MEDICAL_KEYTERMS = [
+    # Conditions
     "hypertension", "diabetes mellitus", "coronary artery disease",
+    # Medications with dosages
     "metformin 1000mg", "lisinopril 10mg", "atorvastatin 20mg",
-    ...
+    # Clinical terms
+    "chief complaint", "history of present illness", "review of systems",
+    "auscultation", "palpation", "echocardiogram",
+    # Vitals
+    "hemoglobin A1c", "blood pressure", "oxygen saturation",
 ]
 ```
 
+### Turn Detection
+
+The VAD (Voice Activity Detection) is configured for clinical conversations where speakers naturally pause longer:
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `stop_secs` | 0.8s | Wait 800ms of silence before finalizing a turn |
+| `confidence` | 0.6 | Speech detection confidence threshold |
+| `min_volume` | 0.4 | Minimum volume threshold to detect speech |
+
 ### LLM Gateway Model
 
-Set `LLM_GATEWAY_MODEL` in `.env` to change the model used for post-processing. Default is `claude-haiku-4-5-20251001`.
+Set `LLM_GATEWAY_MODEL` in `.env` to change the model for post-processing. Default: `claude-haiku-4-5-20251001`
 
-## Hybrid Approach: Streaming + Async
+## Production Considerations
 
-Speaker diarization and PII redaction are **async-only** features in AssemblyAI. The recommended production approach is:
+### Hybrid Streaming + Async Approach
 
-1. **During the visit**: Stream audio for real-time transcription and documentation (this app)
-2. **Post-visit**: Process the recording through AssemblyAI's async API for speaker-labeled, PII-redacted SOAP notes
+For production deployments, consider a hybrid approach:
 
-This gives clinicians immediate access to documentation while ensuring the final record is speaker-attributed and compliant.
+| Phase | Method | Features |
+|-------|--------|----------|
+| **During visit** | Streaming (this app) | Real-time transcription, immediate documentation |
+| **Post-visit** | AssemblyAI Async API | Speaker diarization, PII redaction, compliance-ready output |
+
+Speaker diarization and PII redaction are async-only features. The hybrid approach gives clinicians immediate access to documentation while ensuring the final record is speaker-attributed and HIPAA-compliant.
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ASSEMBLYAI_API_KEY` | Yes | Your AssemblyAI API key |
+| `LLM_GATEWAY_MODEL` | No | Model for post-processing (default: `claude-haiku-4-5-20251001`) |
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/soap` | POST | Generate SOAP note from current encounter |
+| `/api/reset` | POST | Clear the encounter buffer for a new session |
+
+## Project Structure
+
+```
+medical-scribe/pipecat/
+├── medical_scribe.py   # Main pipeline: STT, LLM processing, SOAP generation
+├── run.py              # Server runner with WebSocket broadcasting
+├── requirements.txt    # Python dependencies
+├── .env.example        # Environment template
+└── client/             # Next.js frontend
+    ├── src/
+    └── package.json
+```

@@ -1,47 +1,94 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import {useState, useCallback, useRef, useEffect} from "react";
+import Script from "next/script";
 
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:7860";
 
-/* ================================================================
-   Pre-connection screen
-   ================================================================ */
+declare global {
+  interface Window {
+    DailyIframe: {
+      createCallObject: () => DailyCallObject;
+    };
+  }
+}
+
+interface DailyCallObject {
+  join: (options: {url: string; token: string}) => Promise<void>;
+  leave: () => Promise<void>;
+  destroy: () => void;
+  setLocalAudio: (enabled: boolean) => void;
+  on: (event: string, callback: (...args: unknown[]) => void) => void;
+  off: (event: string, callback: (...args: unknown[]) => void) => void;
+}
 
 export default function Page() {
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [dailyLoaded, setDailyLoaded] = useState(false);
 
-  // WebRTC + WebSocket refs
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const callObjectRef = useRef<DailyCallObject | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
 
-  // Transcript + SOAP state lifted here so it persists across phases
   const [transcripts, setTranscripts] = useState<EditedTranscript[]>([]);
   const [soapNote, setSoapNote] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
   const connect = useCallback(async () => {
+    if (!dailyLoaded) {
+      console.error("Daily.co SDK not loaded yet");
+      return;
+    }
+
     setIsConnecting(true);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
-      });
-      streamRef.current = stream;
-
-      // WebSocket for transcripts
       const wsProtocol = BACKEND_URL.startsWith("https") ? "wss" : "ws";
       const ws = new WebSocket(
-        BACKEND_URL.replace(/^https?/, wsProtocol) + "/ws/transcripts"
+        BACKEND_URL.replace(/^https?/, wsProtocol) + "/ws/transcripts",
       );
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        const now = Date.now();
+        const MERGE_WINDOW_MS = 3000; // 3 second merge window
+
         if (data.type === "transcript") {
-          setTranscripts((prev) => [...prev, data]);
+          setTranscripts((prev) => {
+            // Remove any interim entry
+            const withoutInterim = prev.filter((t) => t.type !== "interim");
+            const last = withoutInterim[withoutInterim.length - 1];
+
+            // Merge if within time window
+            if (
+              last &&
+              last.type === "transcript" &&
+              last._ts &&
+              now - last._ts < MERGE_WINDOW_MS
+            ) {
+              const merged = {
+                ...last,
+                text: last.text + " " + data.text,
+                original:
+                  (last.original || last.text) +
+                  " " +
+                  (data.original || data.text),
+                _ts: now,
+              };
+              return [...withoutInterim.slice(0, -1), merged];
+            }
+
+            return [...withoutInterim, {...data, _ts: now}];
+          });
+        } else if (data.type === "interim") {
+          setTranscripts((prev) => {
+            const last = prev[prev.length - 1];
+            if (last && last.type === "interim") {
+              return [...prev.slice(0, -1), {...data, type: "interim"}];
+            }
+            return [...prev, {...data, type: "interim"}];
+          });
         } else if (data.type === "soap_note") {
           setSoapNote(data.content);
           setStatus(null);
@@ -54,77 +101,51 @@ export default function Page() {
         console.log("WebSocket closed");
       };
 
-      // WebRTC peer connection
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      const roomRes = await fetch(`${BACKEND_URL}/api/create-room`, {
+        method: "POST",
       });
-      pcRef.current = pc;
-      stream.getAudioTracks().forEach((track) => pc.addTrack(track, stream));
+      const {room_url, token, error} = await roomRes.json();
 
-      const startRes = await fetch(`${BACKEND_URL}/start`, { method: "POST" });
-      const { session_id } = await startRes.json();
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      const offerRes = await fetch(
-        `${BACKEND_URL}/sessions/${session_id}/api/offer`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
-        }
-      );
-      const answer = await offerRes.json();
-      await pc.setRemoteDescription(
-        new RTCSessionDescription({ sdp: answer.sdp, type: answer.type })
-      );
-
-      // ICE candidates
-      const candidates: RTCIceCandidateInit[] = [];
-      let gatheringDone = false;
-      const sendCandidates = () => {
-        if (candidates.length > 0) {
-          fetch(`${BACKEND_URL}/sessions/${session_id}/api/offer`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ pc_id: answer.pc_id, candidates }),
-          });
-        }
-      };
-      pc.onicecandidate = (e) => {
-        if (e.candidate) candidates.push(e.candidate.toJSON());
-      };
-      pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === "complete" && !gatheringDone) {
-          gatheringDone = true;
-          sendCandidates();
-        }
-      };
-      if (pc.iceGatheringState === "complete") {
-        gatheringDone = true;
-        sendCandidates();
+      if (error) {
+        console.error("Failed to create room:", error);
+        setIsConnecting(false);
+        return;
       }
 
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "connected") {
-          setIsConnected(true);
-          setIsConnecting(false);
-        }
-      };
+      const callObject = window.DailyIframe.createCallObject();
+      callObjectRef.current = callObject;
+
+      callObject.on("joined-meeting", () => {
+        console.log("Joined Daily room");
+        setIsConnected(true);
+        setIsConnecting(false);
+      });
+
+      callObject.on("left-meeting", () => {
+        console.log("Left Daily room");
+      });
+
+      callObject.on("error", (e: unknown) => {
+        console.error("Daily error:", e);
+      });
+
+      await callObject.join({url: room_url, token});
     } catch (err) {
       console.error("Connection error:", err);
       setIsConnecting(false);
     }
-  }, []);
+  }, [dailyLoaded]);
 
   const disconnect = useCallback(() => {
-    pcRef.current?.close();
-    pcRef.current = null;
-    wsRef.current?.close();
-    wsRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
+    if (callObjectRef.current) {
+      callObjectRef.current.leave();
+      callObjectRef.current.destroy();
+      callObjectRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
     setIsConnected(false);
     setIsConnecting(false);
     setTranscripts([]);
@@ -135,7 +156,7 @@ export default function Page() {
   const requestSoapNote = useCallback(async () => {
     setStatus("Generating SOAP note...");
     try {
-      const res = await fetch(`${BACKEND_URL}/api/soap`, { method: "POST" });
+      const res = await fetch(`${BACKEND_URL}/api/soap`, {method: "POST"});
       const data = await res.json();
       setSoapNote(data.soap_note);
       setStatus(null);
@@ -147,46 +168,67 @@ export default function Page() {
 
   if (!isConnected) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen gap-8">
-        <div className="scribe-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 18.5a6.5 6.5 0 0 0 6.5-6.5V6a6.5 6.5 0 0 0-13 0v6a6.5 6.5 0 0 0 6.5 6.5Z" />
-            <path d="M12 18.5V22" />
-            <path d="M8 22h8" />
-          </svg>
+      <>
+        <Script
+          src="https://unpkg.com/@daily-co/daily-js"
+          onLoad={() => setDailyLoaded(true)}
+        />
+        <div className="flex flex-col items-center justify-center min-h-screen gap-8">
+          <div className="scribe-icon">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 18.5a6.5 6.5 0 0 0 6.5-6.5V6a6.5 6.5 0 0 0-13 0v6a6.5 6.5 0 0 0 6.5 6.5Z" />
+              <path d="M12 18.5V22" />
+              <path d="M8 22h8" />
+            </svg>
+          </div>
+          <div className="flex flex-col items-center gap-2">
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Medical Scribe
+            </h1>
+            <p className="text-zinc-500 text-sm text-center max-w-xs">
+              Ambient clinical documentation powered by Universal-3 Pro
+            </p>
+          </div>
+          <button
+            onClick={connect}
+            disabled={isConnecting || !dailyLoaded}
+            className="px-10 py-3 bg-emerald-600 text-white rounded-full font-medium text-base hover:bg-emerald-500 transition-colors cursor-pointer disabled:opacity-50"
+          >
+            {!dailyLoaded
+              ? "Loading..."
+              : isConnecting
+                ? "Connecting..."
+                : "Start Encounter"}
+          </button>
         </div>
-        <div className="flex flex-col items-center gap-2">
-          <h1 className="text-2xl font-semibold tracking-tight">Medical Scribe</h1>
-          <p className="text-zinc-500 text-sm text-center max-w-xs">
-            Ambient clinical documentation powered by Universal-3 Pro
-          </p>
-        </div>
-        <button
-          onClick={connect}
-          disabled={isConnecting}
-          className="px-10 py-3 bg-emerald-600 text-white rounded-full font-medium text-base hover:bg-emerald-500 transition-colors cursor-pointer disabled:opacity-50"
-        >
-          {isConnecting ? "Connecting..." : "Start Encounter"}
-        </button>
-      </div>
+      </>
     );
   }
 
   return (
-    <MedicalScribeView
-      transcripts={transcripts}
-      soapNote={soapNote}
-      status={status}
-      requestSoapNote={requestSoapNote}
-      disconnect={disconnect}
-      streamRef={streamRef}
-    />
+    <>
+      <Script
+        src="https://unpkg.com/@daily-co/daily-js"
+        onLoad={() => setDailyLoaded(true)}
+      />
+      <MedicalScribeView
+        transcripts={transcripts}
+        soapNote={soapNote}
+        status={status}
+        requestSoapNote={requestSoapNote}
+        disconnect={disconnect}
+        callObjectRef={callObjectRef}
+      />
+    </>
   );
 }
-
-/* ================================================================
-   Encounter timer hook
-   ================================================================ */
 
 function useEncounterTimer() {
   const [elapsed, setElapsed] = useState(0);
@@ -207,19 +249,22 @@ function useEncounterTimer() {
     : `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
-/* ================================================================
-   Types
-   ================================================================ */
-
 interface EditedTranscript {
+  type?: string;
   text: string;
-  original: string;
+  original?: string;
   timestamp: string;
+  _ts?: number;
 }
 
-/* ================================================================
-   Main encounter view
-   ================================================================ */
+interface DailyCallObject {
+  join: (options: {url: string; token: string}) => Promise<void>;
+  leave: () => Promise<void>;
+  destroy: () => void;
+  setLocalAudio: (enabled: boolean) => void;
+  on: (event: string, callback: (...args: unknown[]) => void) => void;
+  off: (event: string, callback: (...args: unknown[]) => void) => void;
+}
 
 function MedicalScribeView({
   transcripts,
@@ -227,28 +272,29 @@ function MedicalScribeView({
   status,
   requestSoapNote,
   disconnect,
-  streamRef,
+  callObjectRef,
 }: {
   transcripts: EditedTranscript[];
   soapNote: string | null;
   status: string | null;
   requestSoapNote: () => void;
   disconnect: () => void;
-  streamRef: React.RefObject<MediaStream | null>;
+  callObjectRef: React.RefObject<DailyCallObject | null>;
 }) {
   const timer = useEncounterTimer();
   const [phase, setPhase] = useState<"recording" | "review">("recording");
 
   const endEncounter = useCallback(() => {
-    streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = false));
+    if (callObjectRef.current) {
+      callObjectRef.current.setLocalAudio(false);
+    }
     setPhase("review");
-  }, [streamRef]);
+  }, [callObjectRef]);
 
   const isRecording = phase === "recording";
 
   return (
     <div className="flex flex-col h-screen">
-      {/* ── Header ────────────────────────────────────── */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-zinc-800/60">
         <div className="flex items-center gap-3">
           {isRecording ? (
@@ -274,9 +320,7 @@ function MedicalScribeView({
         </div>
       </header>
 
-      {/* ── Main content: transcript + SOAP note ─────── */}
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
-        {/* Transcript panel */}
         <div className="flex-1 flex flex-col border-b lg:border-b-0 lg:border-r border-zinc-800/60 min-h-0">
           <div className="px-6 py-3 border-b border-zinc-800/40">
             <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
@@ -286,7 +330,6 @@ function MedicalScribeView({
           <TranscriptPanel transcripts={transcripts} />
         </div>
 
-        {/* SOAP note panel */}
         <div className="flex-1 flex flex-col min-h-0 lg:max-w-[50%]">
           <div className="px-6 py-3 border-b border-zinc-800/40 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
@@ -311,7 +354,6 @@ function MedicalScribeView({
         </div>
       </div>
 
-      {/* ── Footer controls ──────────────────────────── */}
       <footer className="flex items-center justify-center gap-4 px-6 py-4 border-t border-zinc-800/60">
         {isRecording ? (
           <button
@@ -333,11 +375,7 @@ function MedicalScribeView({
   );
 }
 
-/* ================================================================
-   Transcript panel — shows raw text + edited versions
-   ================================================================ */
-
-function TranscriptPanel({ transcripts }: { transcripts: EditedTranscript[] }) {
+function TranscriptPanel({transcripts}: {transcripts: EditedTranscript[]}) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -346,7 +384,10 @@ function TranscriptPanel({ transcripts }: { transcripts: EditedTranscript[] }) {
     }
   }, [transcripts]);
 
-  if (transcripts.length === 0) {
+  const finalTranscripts = transcripts.filter((t) => t.type !== "interim");
+  const currentInterim = transcripts.find((t) => t.type === "interim");
+
+  if (finalTranscripts.length === 0 && !currentInterim) {
     return (
       <div className="flex-1 flex items-center justify-center px-6">
         <div className="max-w-sm">
@@ -367,7 +408,8 @@ function TranscriptPanel({ transcripts }: { transcripts: EditedTranscript[] }) {
           </h3>
           <p className="text-zinc-500 text-sm leading-relaxed text-center mb-4">
             This scribe is listening to the clinical encounter and transcribing
-            in real time. Speak naturally — it captures everything automatically.
+            in real time. Speak naturally — it captures everything
+            automatically.
           </p>
           <div className="space-y-2 text-xs text-zinc-600">
             <div className="flex items-start gap-2">
@@ -376,7 +418,10 @@ function TranscriptPanel({ transcripts }: { transcripts: EditedTranscript[] }) {
             </div>
             <div className="flex items-start gap-2">
               <span className="text-emerald-500 mt-0.5">2.</span>
-              <span>Click <strong className="text-zinc-400">End Encounter</strong> when finished</span>
+              <span>
+                Click <strong className="text-zinc-400">End Encounter</strong>{" "}
+                when finished
+              </span>
             </div>
             <div className="flex items-start gap-2">
               <span className="text-emerald-500 mt-0.5">3.</span>
@@ -393,30 +438,33 @@ function TranscriptPanel({ transcripts }: { transcripts: EditedTranscript[] }) {
       ref={scrollRef}
       className="flex-1 overflow-y-auto px-6 py-4 flex flex-col gap-3 scrollbar-thin"
     >
-      {transcripts.map((entry, i) => (
+      {finalTranscripts.map((entry, i) => (
         <div key={i} className="flex gap-3">
           <span className="text-zinc-600 text-xs font-mono mt-0.5 shrink-0 w-14">
             {entry.timestamp}
           </span>
           <div className="flex-1">
             <p className="text-sm text-zinc-200 leading-relaxed">
-              {entry.original}
+              {entry.text}
             </p>
-            {entry.text !== entry.original && (
-              <p className="text-xs text-emerald-400/70 mt-1 leading-relaxed">
-                {entry.text}
-              </p>
-            )}
           </div>
         </div>
       ))}
+      {currentInterim && (
+        <div className="flex gap-3 animate-pulse">
+          <span className="text-zinc-600 text-xs font-mono mt-0.5 shrink-0 w-14">
+            {currentInterim.timestamp}
+          </span>
+          <div className="flex-1">
+            <p className="text-sm text-zinc-400 leading-relaxed italic">
+              {currentInterim.text}
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-/* ================================================================
-   SOAP note panel
-   ================================================================ */
 
 function SoapNotePanel({
   soapNote,
@@ -483,13 +531,17 @@ function SoapNotePanel({
   );
 }
 
-/* ================================================================
-   Small UI components
-   ================================================================ */
-
 function ClockIcon() {
   return (
-    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      className="w-4 h-4"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <circle cx="12" cy="12" r="10" />
       <polyline points="12 6 12 12 16 14" />
     </svg>
@@ -498,7 +550,15 @@ function ClockIcon() {
 
 function NoteIcon() {
   return (
-    <svg className="w-10 h-10 text-zinc-600 mx-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      className="w-10 h-10 text-zinc-600 mx-auto"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
       <polyline points="14 2 14 8 20 8" />
       <line x1="16" y1="13" x2="8" y2="13" />
